@@ -1,0 +1,15 @@
+[package]
+name = "go-impl-view"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+sha2 = "0.10"
+tar = { version = "0.4", default-features = false }
+zip = { version = "2.4", default-features = false, features = ["deflate-flate2", "flate2"] }
+zed_extension_api = "0.7.0"
