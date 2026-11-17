@@ -1,6 +1,6 @@
 id = "go-impl-view-lsp"
 name = "Go Implementation View"
-version = "0.1.0"
+version = "0.1.1"
 schema_version = 1
 authors = ["0x0FACED"]
 description = "Go interface implementations and struct interfaces as navigable CodeLens."

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 )
@@ -24,24 +25,25 @@ type flight struct {
 	err    error
 }
 type server struct {
-	conn           *connection
-	mu             sync.Mutex
-	roots          []string
-	documents      map[string]document
-	options        options
-	configErr      error
-	generation     uint64
-	generationCtx  context.Context
-	invalidate     context.CancelFunc
-	cache          *flight
-	errorReported  bool
-	requests       map[string]context.CancelFunc
-	initialized    bool
-	shutdown       bool
-	refreshSupport bool
-	watchSupport   bool
-	sequence       uint64
-	workers        sync.WaitGroup
+	conn            *connection
+	mu              sync.Mutex
+	roots           []string
+	documents       map[string]document
+	options         options
+	configErr       error
+	generation      uint64
+	generationCtx   context.Context
+	invalidate      context.CancelFunc
+	cache           map[string]*flight
+	errorReported   map[string]bool
+	warningReported map[string]bool
+	requests        map[string]context.CancelFunc
+	initialized     bool
+	shutdown        bool
+	refreshSupport  bool
+	watchSupport    bool
+	sequence        uint64
+	workers         sync.WaitGroup
 }
 
 func newServer(conn *connection) *server {
@@ -210,7 +212,7 @@ func (s *server) initialize(m message) {
 			"codeLensProvider": map[string]any{"resolveProvider": false},
 			"workspace":        map[string]any{"workspaceFolders": map[string]any{"supported": true, "changeNotifications": true}},
 		},
-		"serverInfo": map[string]any{"name": "go-impl-view", "version": "0.1.0"},
+		"serverInfo": map[string]any{"name": "go-impl-view", "version": "0.1.1"},
 	}, nil)
 	// Store registration capability separately: registration is sent only after
 	// the initialized notification, when the LSP permits server requests.
@@ -222,7 +224,7 @@ func (s *server) initialize(m message) {
 func (s *server) codeLenses(ctx context.Context, cancel context.CancelFunc, id json.RawMessage, path string, generation uint64) {
 	defer s.workers.Done()
 	defer cancel()
-	result, err := s.getAnalysis(ctx, generation)
+	result, err := s.getAnalysis(ctx, generation, path)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.requests, string(id))
@@ -233,18 +235,94 @@ func (s *server) codeLenses(ctx context.Context, cancel context.CancelFunc, id j
 		failure = &rpcError{Code: -32800, Message: "request cancelled"}
 	}
 	lenses := []codeLens{}
-	if failure == nil && err != nil && !s.errorReported {
-		s.errorReported = true
-		s.report(err)
+	if failure == nil && err != nil {
+		errorKey, keyErr := s.analysisKey(path)
+		if keyErr != nil {
+			errorKey = path
+		}
+		if !s.errorReported[errorKey] {
+			if s.errorReported == nil {
+				s.errorReported = map[string]bool{}
+			}
+			s.errorReported[errorKey] = true
+			s.report(err)
+		}
 	}
 	if failure == nil && result != nil {
-		if found := result.lenses[path]; found != nil {
+		if len(result.warnings) > 0 {
+			key, keyErr := s.analysisKey(path)
+			if keyErr != nil {
+				key = path
+			}
+			if !s.warningReported[key] {
+				if s.warningReported == nil {
+					s.warningReported = map[string]bool{}
+				}
+				s.warningReported[key] = true
+				for _, warning := range result.warnings {
+					_ = s.conn.notify("window/logMessage", map[string]any{"type": 2, "message": "go-impl-view: " + warning})
+				}
+			}
+		}
+		found := result.lenses[path]
+		if found == nil {
+			found = result.lenses[canonicalFile(path)]
+		}
+		if found != nil {
 			lenses = found
 		}
 	}
 	_ = s.conn.reply(id, lenses, failure)
 }
-func (s *server) getAnalysis(ctx context.Context, generation uint64) (*analysis, error) {
+
+// Caller holds mu. Include the nearest workspace boundary because two files
+// in one module can have different nested go.work files.
+func (s *server) analysisKey(path string) (string, error) {
+	exists := func(path string) bool {
+		if _, exists := s.documents[path]; exists {
+			return true
+		}
+		name := filepath.Base(path)
+		resolved := ""
+		for candidate := range s.documents {
+			if filepath.Base(candidate) != name {
+				continue
+			}
+			if resolved == "" {
+				resolved = canonicalFile(path)
+			}
+			if canonicalFile(candidate) == resolved {
+				return true
+			}
+		}
+		return false
+	}
+	mod, err := ancestorFile(path, "go.mod", exists)
+	if err != nil {
+		return "", err
+	}
+	key := filepath.Dir(path)
+	if mod != "" {
+		key = filepath.Dir(mod)
+	}
+	setting, explicit := s.options.Env["GOWORK"]
+	if !explicit {
+		setting = os.Getenv("GOWORK")
+	}
+	if setting != "" && setting != "auto" {
+		return key, nil
+	}
+	work, err := ancestorFile(path, "go.work", exists)
+	if err != nil {
+		return "", err
+	}
+	if work != "" {
+		key += "\x00" + work
+	}
+	return key, nil
+}
+
+func (s *server) getAnalysis(ctx context.Context, generation uint64, path string) (*analysis, error) {
 	s.mu.Lock()
 	if generation != s.generation || ctx.Err() != nil {
 		s.mu.Unlock()
@@ -255,19 +333,24 @@ func (s *server) getAnalysis(ctx context.Context, generation uint64) (*analysis,
 		s.mu.Unlock()
 		return nil, err
 	}
-	for path, doc := range s.documents {
-		if doc.invalid != "" {
-			s.mu.Unlock()
-			return nil, fmt.Errorf("document %s is out of sync: %s; reopen it", path, doc.invalid)
-		}
+	key, err := s.analysisKey(path)
+	if err != nil {
+		s.mu.Unlock()
+		return nil, err
 	}
-	current := s.cache
+	current := s.cache[key]
 	if current == nil {
 		current = &flight{done: make(chan struct{})}
-		s.cache = current
-		snap := snapshot{roots: append([]string(nil), s.roots...), overlay: make(map[string][]byte, len(s.documents)), options: s.options}
+		if s.cache == nil {
+			s.cache = map[string]*flight{}
+		}
+		s.cache[key] = current
+		snap := snapshot{path: path, roots: append([]string(nil), s.roots...), overlay: make(map[string][]byte, len(s.documents)), invalid: map[string]string{}, options: s.options}
 		for path, doc := range s.documents {
 			snap.overlay[path] = doc.text
+			if doc.invalid != "" {
+				snap.invalid[path] = doc.invalid
+			}
 		}
 		generationCtx := s.generationCtx
 		s.workers.Add(1)
@@ -310,7 +393,8 @@ func (s *server) changed() {
 	s.generation++
 	s.generationCtx, s.invalidate = context.WithCancel(context.Background())
 	s.cache = nil
-	s.errorReported = false
+	s.errorReported = nil
+	s.warningReported = nil
 	if s.refreshSupport {
 		s.sequence++
 		_ = s.conn.send(map[string]any{"jsonrpc": "2.0", "id": fmt.Sprintf("go-impl-refresh-%d", s.sequence), "method": "workspace/codeLens/refresh"})

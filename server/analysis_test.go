@@ -23,7 +23,7 @@ func fixture(t *testing.T, files map[string]string) string {
 	return root
 }
 func fixtureSnapshot(root string) snapshot {
-	return snapshot{roots: []string{root}, overlay: map[string][]byte{}, options: options{Env: map[string]string{"GOWORK": "off", "GOFLAGS": "", "GOPROXY": "off"}}}
+	return snapshot{path: filepath.Join(root, "main.go"), roots: []string{root}, overlay: map[string][]byte{}, options: options{Env: map[string]string{"GOWORK": "off", "GOFLAGS": "", "GOPROXY": "off"}}}
 }
 func typeLens(t *testing.T, result *analysis, path, source, name string) codeLens {
 	t.Helper()
@@ -202,7 +202,7 @@ func TestAnalysisUsesUnsavedOverlaysAndBuildFlags(t *testing.T) {
 	}
 }
 
-func TestGenericExclusionsDoNotClaimExactCounts(t *testing.T) {
+func TestUnobservedGenericDeclarationsDoNotClaimExactCounts(t *testing.T) {
 	source := `package specimen
 type I interface { M() }
 type A struct{}
@@ -220,22 +220,26 @@ func generic[T any]() { type Local struct{}; _ = Local{} }
 	}
 	path := filepath.Join(root, "main.go")
 	lens := typeLens(t, result, path, source, "I")
-	if !strings.Contains(lens.Command.Title, "incomplete") || strings.Contains(lens.Command.Title, "1 implementation") {
+	if lens.Command.Title != "1+ implementations" {
 		t.Fatal(lens.Command.Title)
 	}
 	if len(targetsOf(t, lens)) != 1 {
 		t.Fatalf("generic candidate leaked: %#v", targetsOf(t, lens))
 	}
 	reverse := typeLens(t, result, path, source, "A")
-	if !strings.Contains(reverse.Command.Title, "incomplete: generic interfaces excluded") || strings.Contains(reverse.Command.Title, "1 interface") {
+	if reverse.Command.Title != "1+ interfaces" {
 		t.Fatal(reverse.Command.Title)
 	}
 	if targets := targetsOf(t, reverse); len(targets) != 1 || targets[0].Range != lens.Range {
 		t.Fatalf("generic interface leaked: %#v", targets)
 	}
-	for _, name := range []string{"Generic", "GenericI", "Constraint", "Local"} {
-		assertNoTypeLens(t, result, path, source, name)
+	for _, name := range []string{"Generic", "GenericI", "Local"} {
+		lens := typeLens(t, result, path, source, name)
+		if !strings.Contains(lens.Command.Title, "0+") || len(targetsOf(t, lens)) != 0 {
+			t.Fatalf("unobserved declaration %s claimed an exact count: %#v", name, lens)
+		}
 	}
+	assertNoTypeLens(t, result, path, source, "Constraint")
 }
 
 func TestAnalysisErrorsNeverReturnCounts(t *testing.T) {
@@ -263,6 +267,7 @@ func TestGoWorkModulesShareOneTypeGraph(t *testing.T) {
 		"impl/impl.go": "package impl\nimport \"example.com/api\"\ntype T struct{}\nfunc (T) M(api.Arg) {}\n",
 	})
 	snap := fixtureSnapshot(root)
+	snap.path = filepath.Join(root, "api", "api.go")
 	snap.options.Env["GOWORK"] = filepath.Join(root, "go.work")
 	result, err := analyze(context.Background(), snap)
 	if err != nil {
@@ -504,12 +509,16 @@ type Generic[P any] struct{}
 	if lens.Command.Title != "1 interface" || len(targetsOf(t, lens)) != 1 {
 		t.Fatalf("constraint or generic concrete type affected interfaces: %#v", lens)
 	}
-	for _, name := range []string{"Constraint", "GenericConstraint", "Comparable", "MethodConstraint", "Generic"} {
+	for _, name := range []string{"Constraint", "GenericConstraint", "Comparable", "MethodConstraint"} {
 		assertNoTypeLens(t, result, path, source, name)
+	}
+	generic := typeLens(t, result, path, source, "Generic")
+	if generic.Command.Title != "0+ interfaces" || len(targetsOf(t, generic)) != 0 {
+		t.Fatalf("unobserved generic struct: %#v", generic)
 	}
 }
 
-func TestExcludedGenericInterfacesMarkZeroCountsIncomplete(t *testing.T) {
+func TestUnobservedGenericInterfacesMarkZeroCountsIncomplete(t *testing.T) {
 	for _, source := range []string{
 		"package specimen\ntype T struct{}\ntype GenericI[P any] interface { Put(P) }\n",
 		"package specimen\ntype T struct{}\nfunc generic[P any]() { type LocalI interface { Put(P) }; var _ LocalI }\n",
@@ -521,7 +530,7 @@ func TestExcludedGenericInterfacesMarkZeroCountsIncomplete(t *testing.T) {
 			t.Fatal(err)
 		}
 		lens := typeLens(t, result, filepath.Join(root, "main.go"), source, "T")
-		if lens.Command.Title != "Known interfaces (incomplete: generic interfaces excluded)" || len(targetsOf(t, lens)) != 0 {
+		if lens.Command.Title != "0+ interfaces" || len(targetsOf(t, lens)) != 0 {
 			t.Fatalf("excluded generic interface claimed zero: %#v", lens)
 		}
 	}

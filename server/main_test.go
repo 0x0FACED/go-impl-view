@@ -93,7 +93,7 @@ func TestChangesCancelGenerationRefreshAndRejectOldRequest(t *testing.T) {
 	oldGeneration := s.generation
 	ctx, cancel := context.WithCancel(s.generationCtx)
 	s.requests["1"] = cancel
-	s.cache = &flight{done: make(chan struct{})}
+	s.cache = map[string]*flight{s.roots[0]: {done: make(chan struct{})}}
 	s.notification(notificationFor(t, "textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": fileURI(filepath.Join(s.roots[0], "other.go")), "version": 1, "text": "package p\n"}}))
 	if ctx.Err() == nil || s.generation == oldGeneration || s.cache != nil {
 		t.Fatal("edit failed to cancel and invalidate prior generation")
@@ -119,7 +119,7 @@ func TestDocumentOverlaysIncrementalEditsSaveCloseAndWatchedFiles(t *testing.T) 
 	s.notification(notificationFor(t, "textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": fileURI(path), "version": 1, "text": openText}}))
 	assertTitle := func(want string) {
 		t.Helper()
-		result, err := s.getAnalysis(context.Background(), s.generation)
+		result, err := s.getAnalysis(context.Background(), s.generation, filepath.Join(root, "main.go"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -174,7 +174,7 @@ func TestEmptyConfigurationPreservesInitializationOptions(t *testing.T) {
 	}))
 	assertTitle := func(want string) {
 		t.Helper()
-		result, err := s.getAnalysis(context.Background(), s.generation)
+		result, err := s.getAnalysis(context.Background(), s.generation, filepath.Join(root, "main.go"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -212,7 +212,7 @@ func TestGoWorkOutsideOpenedRootsCannotReuseCachedCounts(t *testing.T) {
 	work := filepath.Join(api, "go.work")
 	s, _ := testServer(t, api)
 	s.options.Env["GOWORK"] = work
-	result, err := s.getAnalysis(context.Background(), s.generation)
+	result, err := s.getAnalysis(context.Background(), s.generation, filepath.Join(api, "api.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestGoWorkOutsideOpenedRootsCannotReuseCachedCounts(t *testing.T) {
 		t.Fatal(err)
 	}
 	s.notification(notificationFor(t, "workspace/didChangeWatchedFiles", map[string]any{"changes": []any{map[string]any{"uri": fileURI(work), "type": 2}}}))
-	if result, err := s.getAnalysis(context.Background(), s.generation); result != nil || err == nil || !strings.Contains(err.Error(), "outside the opened workspace roots") {
+	if result, err := s.getAnalysis(context.Background(), s.generation, filepath.Join(api, "api.go")); result != nil || err == nil || !strings.Contains(err.Error(), "outside the opened workspace roots") {
 		t.Fatalf("unwatched go.work use reused cached counts: %#v, %v", result, err)
 	}
 }
@@ -233,7 +233,7 @@ func TestInvalidIncrementalEditCannotReuseCounts(t *testing.T) {
 	path := filepath.Join(s.roots[0], "main.go")
 	s.notification(notificationFor(t, "textDocument/didOpen", map[string]any{"textDocument": map[string]any{"uri": fileURI(path), "version": 1, "text": "package p\n// 😀\n"}}))
 	s.notification(notificationFor(t, "textDocument/didChange", map[string]any{"textDocument": map[string]any{"uri": fileURI(path), "version": 2}, "contentChanges": []any{map[string]any{"range": sourceRange{Start: position{1, 4}, End: position{1, 4}}, "text": "x"}}}))
-	if result, err := s.getAnalysis(context.Background(), s.generation); err == nil || result != nil {
+	if result, err := s.getAnalysis(context.Background(), s.generation, path); err == nil || result != nil {
 		t.Fatalf("invalid edit returned counts: %#v %v", result, err)
 	}
 	if s.documents[path].invalid == "" {
@@ -245,7 +245,7 @@ func TestPendingAnalysisClearsLensesThenRefreshesOnce(t *testing.T) {
 	root := fixture(t, map[string]string{"go.mod": "module example.com/specimen\n\ngo 1.26.0\n", "main.go": "package specimen\ntype I interface { M() }\n"})
 	s, output := testServer(t, root)
 	s.refreshSupport = true
-	result, err := s.getAnalysis(context.Background(), s.generation)
+	result, err := s.getAnalysis(context.Background(), s.generation, filepath.Join(root, "main.go"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestPendingAnalysisClearsLensesThenRefreshesOnce(t *testing.T) {
 		t.Fatal("no pending analysis")
 	}
 	select {
-	case <-s.cache.done:
+	case <-s.cache[root].done:
 	case <-time.After(30 * time.Second):
 		t.Fatal("analysis did not finish")
 	}
@@ -264,7 +264,7 @@ func TestPendingAnalysisClearsLensesThenRefreshesOnce(t *testing.T) {
 	if before != 1 {
 		t.Fatalf("expected one completion refresh, got %d", before)
 	}
-	result, err = s.getAnalysis(context.Background(), s.generation)
+	result, err = s.getAnalysis(context.Background(), s.generation, filepath.Join(root, "main.go"))
 	if err != nil || result == nil {
 		t.Fatalf("ready analysis missing: %#v %v", result, err)
 	}
